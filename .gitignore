@@ -47,3 +47,17 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+# R標準
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+
+# 患者データ・個人情報を含む可能性のあるもの
+data/
+*.xlsx
+*.csv
+
+# 出力先（Desktop/figures）
+figures/
