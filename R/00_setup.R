@@ -1,4 +1,3 @@
-00_setup/R
 # =============================================================
 # 00_setup.R
 # Project: Recovery Time of Diaphragm Paralysis after
