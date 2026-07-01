@@ -215,7 +215,7 @@ aft_df <- bind_rows(
 
 
 # ============================================================
-# 5. Figure 1
+# 5. Figure 1（JTCVS対応版）
 # ============================================================
 COL_TURNBULL <- "#1F3864"
 COL_SHADE    <- "#1F3864"
@@ -255,14 +255,12 @@ annot_text <- sprintf(
 
 fig1 <- ggplot() +
 
-  # Bootstrap 95% CI ribbon
   geom_ribbon(
     data = boot_df,
     aes(x = time, ymin = boot_lower * 100, ymax = boot_upper * 100),
     fill = COL_SHADE, alpha = 0.15, show.legend = FALSE
   ) +
 
-  # Parametric AFT curves
   geom_line(
     data = aft_df,
     aes(x = time, y = cumrec * 100,
@@ -275,7 +273,6 @@ fig1 <- ggplot() +
     guide  = "none"
   ) +
 
-  # Turnbull NPMLE step curve
   geom_step(
     data = tb_df_line,
     aes(x = time, y = cumrec * 100,
@@ -283,7 +280,6 @@ fig1 <- ggplot() +
     linewidth = 1.0, direction = "hv"
   ) +
 
-  # Median reference lines
   geom_vline(xintercept = med_val,
              linetype = "longdash", color = "grey40",
              linewidth = 0.5) +
@@ -291,15 +287,13 @@ fig1 <- ggplot() +
              linetype = "longdash", color = "grey40",
              linewidth = 0.5) +
 
-  # Median annotation
   annotate("label",
            x = 200, y = 35,
            label = annot_text,
            size = 3.0, hjust = 0,
            fill = "white", color = "grey30",
-           label.size = 0.3, family = "serif") +
+           label.size = 0.3, family = "sans") +   # ← serif から sans に変更
 
-  # Scales
   scale_color_manual(
     name   = NULL,
     values = all_colors,
@@ -325,8 +319,8 @@ fig1 <- ggplot() +
     expand = expansion(mult = c(0, 0.02))
   ) +
 
-  # JAMA-style theme
-  theme_classic(base_family = "serif", base_size = 11) +
+  # JTCVS-style theme（sans-serif、タイトル・サブタイトル・キャプションなし）
+  theme_classic(base_family = "sans", base_size = 11) +
   theme(
     axis.title        = element_text(size = 10),
     axis.text         = element_text(size = 9, color = "grey20"),
@@ -335,40 +329,17 @@ fig1 <- ggplot() +
     legend.position   = c(0.98, 0.25),
     legend.justification = c(1, 0),
     legend.title      = element_blank(),
-    legend.text       = element_text(size = 8.5, family = "serif"),
+    legend.text       = element_text(size = 8.5, family = "sans"),
     legend.key.width  = unit(1.8, "cm"),
     legend.background = element_rect(fill = "white", color = "grey80",
                                      linewidth = 0.3),
     panel.grid        = element_blank(),
-    plot.title        = element_text(size = 11, face = "bold"),
-    plot.subtitle     = element_text(size = 9, color = "grey40"),
-    plot.caption      = element_text(size = 7.5, color = "grey50",
-                                     hjust = 0),
     plot.margin       = margin(10, 15, 10, 10)
-  ) +
-
-  labs(
-    title    = "Figure 1. Recovery from Diaphragm Paralysis After Congenital Heart Surgery",
-    subtitle = paste0(
-      "Turnbull nonparametric maximum likelihood estimate with ",
-      "2000-iteration bootstrap 95% CI;\n",
-      "overlaid with Weibull, log-normal, and log-logistic ",
-      "AFT model fits"
-    ),
-    caption  = paste0(
-      "Shaded band: bootstrap 95% pointwise confidence interval ",
-      "(2000 resamples). Log-logistic model selected based on ",
-      "lowest AIC.\n",
-      "All models fitted using interval-censored likelihood. ",
-      "Display truncated at 1095 days; one patient with confirmed ",
-      "recovery at 2527 days is included in the analysis.\n",
-      "AIC = Akaike information criterion; ",
-      "AFT = accelerated failure time."
-    )
   )
+  # labs(title=..., subtitle=..., caption=...) は削除
+  # → Figure Legendは本文のFigure Legends欄に記載
 
 print(fig1)
-
 
 # ============================================================
 # 6. 出力（PDF + TIFF 600dpi）
