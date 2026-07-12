@@ -112,6 +112,509 @@ tb_df_line <- tb_df_extended %>%
 
 
 # ============================================================
+# 2. Bootstrap 95% CI（2000 iterations、決定論的キャッシュ方式）
+#    一部のリサンプルでTurnbull EMアルゴリズムが病的に遅くなる
+#    ケースが確認された。壁時計タイムアウトだけに頼ると、
+#    「どのリサンプルがスキップされるか」がPCの処理速度に
+#    依存してしまい、Bootstrap CIが再現性を持たなくなる。
+#    そこで、初回実行時にタイムアウトしたリサンプル番号を
+#    キャッシュファイルに保存し、以降は保存された番号を
+#    機械的に再利用することで、実行環境によらず常に同一の
+#    結果が得られるようにする。
+#    ※ cache/bootstrap_skip_indices.rds はGitHubリポジトリに
+#      コミットし、Zenodoアーカイブにも含めること
+#      （再現性の担保に必須）。
+# ============================================================
+if (!requireNamespace("R.utils", quietly = TRUE)) {
+  install.packages("R.utils")
+}
+library(R.utils)
+
+df_boot <- df %>%
+  mutate(
+    left_time = ifelse(
+      is.na(right_time) & left_time > t_max,
+      t_max, left_time
+    )
+  )
+
+B <- 2000
+
+# --- リサンプルindexを事前に一括生成（乱数ストリームを固定） ---
+set.seed(1234)
+idx_list <- lapply(seq_len(B), function(b) sample(nrow(df_boot), replace = TRUE))
+
+cache_dir  <- "R/cache"
+cache_file <- file.path(cache_dir, "bootstrap_skip_indices.rds")
+if (!dir.exists(cache_dir)) dir.create(cache_dir, recursive = TRUE)
+
+if (file.exists(cache_file)) {
+  skip_set <- readRDS(cache_file)
+  cat(sprintf("キャッシュを読み込みました: %d 件のリサンプルをスキップ（%s）\n",
+              length(skip_set), cache_file))
+} else {
+  skip_set <- NULL
+  cat("キャッシュが存在しないため、今回の実行結果をキャッシュとして保存します。\n")
+}
+
+cat("Bootstrap CI計算中（2000回）...\n")
+boot_mat   <- matrix(NA, nrow = B, ncol = length(time_grid))
+t0         <- Sys.time()
+n_errors   <- 0
+n_timeouts <- 0
+newly_skipped <- integer(0)
+
+for (b in seq_len(B)) {
+  
+  # キャッシュに「スキップ対象」として記録済みなら、計算自体を行わず
+  # 即座にスキップする（再現性・高速化の両方に寄与）
+  if (!is.null(skip_set) && b %in% skip_set) {
+    n_timeouts <- n_timeouts + 1
+    next
+  }
+  
+  df_b <- df_boot[idx_list[[b]], ]
+  
+  result <- tryCatch({
+    withTimeout({
+      fit_b <- survfit(
+        Surv(left_time, right_time, type = "interval2") ~ 1,
+        data = df_b
+      )
+      S_b <- stepfun(fit_b$time, c(1, fit_b$surv))
+      1 - S_b(time_grid)
+    }, timeout = 2, onTimeout = "silent")
+  }, error = function(e) {
+    n_errors <<- n_errors + 1
+    NULL
+  })
+  
+  if (is.null(result)) {
+    n_timeouts <- n_timeouts + 1
+    newly_skipped <- c(newly_skipped, b)
+  } else {
+    boot_mat[b, ] <- result
+  }
+  
+  if (b %% 200 == 0) {
+    elapsed <- as.numeric(Sys.time() - t0, units = "secs")
+    cat(sprintf("  [%d/%d] elapsed: %.1f sec, timeouts/errors so far: %d\n",
+                b, B, elapsed, n_timeouts))
+  }
+}
+
+# 初回実行時のみ、新たに判明したスキップ対象をキャッシュに保存
+if (is.null(skip_set) && length(newly_skipped) > 0) {
+  saveRDS(newly_skipped, cache_file)
+  cat(sprintf("スキップ対象 %d 件を %s に保存しました。\n",
+              length(newly_skipped), cache_file))
+} else if (is.null(skip_set)) {
+  saveRDS(integer(0), cache_file)
+  cat(sprintf("タイムアウトは0件でした。空のキャッシュを %s に保存しました。\n",
+              cache_file))
+}
+
+cat(sprintf("Bootstrap完了: %.1f sec, skipped %d/%d resamples (timeout or error)\n\n",
+            as.numeric(Sys.time() - t0, units = "secs"), n_timeouts, B))
+
+boot_lo  <- apply(boot_mat, 2, quantile, probs = 0.025, na.rm = TRUE)
+boot_hi  <- apply(boot_mat, 2, quantile, probs = 0.975, na.rm = TRUE)
+boot_med <- apply(boot_mat, 2, median,   na.rm = TRUE)
+
+boot_df <- data.frame(
+  time       = time_grid,
+  cumrec     = boot_med,
+  boot_lower = boot_lo,
+  boot_upper = boot_hi
+)
+cat("Bootstrap完了\n\n")
+
+
+# ============================================================
+# 3. 中央値回復時間
+# ============================================================
+med_est <- quantile(fit_km, probs = 0.5)
+med_val <- round(med_est$quantile)
+
+med_lo_boot <- time_grid[which.min(abs(boot_hi - 0.5))]
+med_hi_boot <- time_grid[which.min(abs(boot_lo - 0.5))]
+
+cat(sprintf(
+  "Median recovery: %d days (95%% bootstrap CI: %d\u2013%d days)\n\n",
+  med_val, med_lo_boot, med_hi_boot))
+
+
+# ============================================================
+# 4. Parametric AFT Models
+# ============================================================
+df_aft <- df %>%
+  mutate(
+    left_time  = ifelse(left_time == 0, 0.5, left_time),
+    right_time = ifelse(!is.na(right_time) & right_time == 0,
+                        0.5, right_time)
+  )
+
+cat("AFTモデル推定中...\n")
+fit_wei <- flexsurvreg(
+  Surv(left_time, right_time, type = "interval2") ~ 1,
+  data = df_aft, dist = "weibull"
+)
+fit_ln <- flexsurvreg(
+  Surv(left_time, right_time, type = "interval2") ~ 1,
+  data = df_aft, dist = "lnorm"
+)
+fit_ll_final <- flexsurvreg(
+  Surv(left_time, right_time, type = "interval2") ~ 1,
+  data = df_aft, dist = "llogis"
+)
+
+aic_tbl <- data.frame(
+  Model = c("Weibull", "Log-normal", "Log-logistic"),
+  AIC   = c(AIC(fit_wei), AIC(fit_ln),  AIC(fit_ll_final)),
+  BIC   = c(BIC(fit_wei), BIC(fit_ln),  BIC(fit_ll_final))
+) %>%
+  mutate(
+    delta_AIC = AIC - min(AIC),
+    delta_BIC = BIC - min(BIC)
+  ) %>%
+  arrange(AIC)
+
+cat("\n=== Model Selection (AIC / BIC) ===\n")
+print(aic_tbl)
+best_model <- aic_tbl$Model[1]
+cat(sprintf("\nSelected model (lowest AIC): %s\n\n", best_model))
+
+make_aft_df <- function(fit, label, time_grid) {
+  S <- summary(fit, t = time_grid, type = "survival")[[1]]
+  data.frame(
+    time   = time_grid,
+    cumrec = 1 - S$est,
+    model  = label
+  )
+}
+
+aft_df <- bind_rows(
+  make_aft_df(fit_wei,      "Weibull",      time_grid),
+  make_aft_df(fit_ln,       "Log-normal",   time_grid),
+  make_aft_df(fit_ll_final, "Log-logistic", time_grid)
+) %>%
+  mutate(selected = model == best_model)
+
+
+# ============================================================
+# 5. Number-at-risk代替指標（フォローアップ継続患者数）
+#    Turnbull（区間打ち切り）では標準的なKM at-riskは
+#    方法論的に定義不可のため、「最終観察時点 >= t」を
+#    満たす患者数を代替指標として使用する。
+#    - 回復確定例: 最終観察 = right_time（回復確認日）
+#    - 打ち切り例  : 最終観察 = left_time（最終異常所見日）
+# ============================================================
+last_obs_time <- with(df, ifelse(is.na(right_time), left_time, right_time))
+
+risk_breaks_years <- seq(0, floor(t_max / 365.25 * 2) / 2, by = 0.5)
+# 表示終端（t_max）がグリッドに乗らない場合、終端自体も
+# ブレークとして追加する（曲線の右端に対応する数字が必ず出るように）
+t_max_years <- t_max / 365.25
+if (max(risk_breaks_years) < t_max_years - 0.01) {
+  risk_breaks_years <- c(risk_breaks_years, round(t_max_years, 2))
+}
+risk_breaks_days  <- risk_breaks_years * 365.25
+risk_breaks_days  <- pmin(risk_breaks_days, t_max)
+
+n_followed <- sapply(risk_breaks_days, function(t) sum(last_obs_time >= t))
+
+risk_table <- data.frame(
+  time_years = risk_breaks_years,
+  time_days  = risk_breaks_days,
+  n_followed = n_followed
+)
+cat("\n=== Number of patients followed to each time point ===\n")
+print(risk_table)
+cat(sprintf("\nMinimum n_followed within displayed range (0-%.1f yr): %d\n",
+            max(risk_breaks_years), min(n_followed)))
+cat("(Requirement: must remain \u2265 10 throughout displayed range)\n\n")
+
+
+# ============================================================
+# 6. Figure 1（cowplotによる2パネル結合：align="v", axis="lr"）
+#    survminer等が内部で使うのと同じ手法。2パネルの左右軸位置を
+#    ピクセル単位で強制的に揃えるため、patchworkで生じていた
+#    ズレの問題が原理的に発生しない。
+# ============================================================
+COL_TURNBULL <- "#1F3864"
+COL_SHADE    <- "#1F3864"
+COL_WEI      <- "#E07B39"
+COL_LN       <- "#2A9D8F"
+COL_LL       <- "#C0392B"
+
+legend_order <- c("Turnbull NPMLE", "Log-logistic",
+                  "Log-normal", "Weibull")
+
+all_colors <- c(
+  "Turnbull NPMLE" = COL_TURNBULL,
+  "Log-logistic"   = COL_LL,
+  "Log-normal"     = COL_LN,
+  "Weibull"        = COL_WEI
+)
+all_ltypes <- c(
+  "Turnbull NPMLE" = "solid",
+  "Log-logistic"   = "dotdash",
+  "Log-normal"     = "dotted",
+  "Weibull"        = "dashed"
+)
+all_labels <- c(
+  "Turnbull NPMLE" = "Turnbull NPMLE (Bootstrap 95% CI)",
+  "Log-logistic"   = sprintf("Log-logistic (AIC = %.1f)",
+                             AIC(fit_ll_final)),
+  "Log-normal"     = sprintf("Log-normal (AIC = %.1f)",
+                             AIC(fit_ln)),
+  "Weibull"        = sprintf("Weibull (AIC = %.1f)",
+                             AIC(fit_wei))
+)
+
+annot_text <- sprintf(
+  "Median recovery: %d days\n(95%% bootstrap CI: %d\u2013%d days)",
+  med_val, med_lo_boot, med_hi_boot
+)
+
+x_breaks_years <- risk_breaks_years
+x_breaks_days  <- risk_breaks_days
+x_labels       <- as.character(x_breaks_years)
+
+# 両パネルで完全に同一のX軸定義を共有する（これがズレ防止の要）
+shared_x_scale <- scale_x_continuous(
+  limits = c(0, t_max),
+  breaks = x_breaks_days,
+  labels = x_labels,
+  expand = expansion(mult = c(0, 0.02))   # 左側の余白を除去し、X=0とY軸を一致させる
+)
+
+# --- 上段: 曲線パネル（X軸ラベルなし） ---
+fig1_main <- ggplot() +
+  
+  geom_ribbon(
+    data = boot_df,
+    aes(x = time, ymin = boot_lower * 100, ymax = boot_upper * 100),
+    fill = COL_SHADE, alpha = 0.15, show.legend = FALSE
+  ) +
+  
+  geom_line(
+    data = aft_df,
+    aes(x = time, y = cumrec * 100,
+        color = model, linetype = model,
+        linewidth = selected),
+    alpha = 0.85
+  ) +
+  scale_linewidth_manual(
+    values = c("TRUE" = 0.7, "FALSE" = 0.55),
+    guide  = "none"
+  ) +
+  
+  geom_step(
+    data = tb_df_line,
+    aes(x = time, y = cumrec * 100,
+        color = model, linetype = model),
+    linewidth = 1.0, direction = "hv"
+  ) +
+  
+  geom_vline(xintercept = med_val,
+             linetype = "longdash", color = "grey40",
+             linewidth = 0.5) +
+  geom_hline(yintercept = 50,
+             linetype = "longdash", color = "grey40",
+             linewidth = 0.5) +
+  
+  annotate("label",
+           x = 50, y = 100,
+           label = annot_text,
+           size = 3.0, hjust = 0, vjust = 1,
+           fill = "white", color = "grey30",
+           label.size = 0.3, family = "sans") +
+  
+  scale_color_manual(
+    name   = NULL,
+    values = all_colors,
+    labels = all_labels,
+    breaks = legend_order
+  ) +
+  scale_linetype_manual(
+    name   = NULL,
+    values = all_ltypes,
+    labels = all_labels,
+    breaks = legend_order
+  ) +
+  shared_x_scale +
+  scale_y_continuous(
+    name   = "Cumulative recovery probability (%)",
+    limits = c(0, 100),
+    breaks = seq(0, 100, by = 25),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  labs(x = "Time from diaphragm paralysis diagnosis (years)") +
+  theme_classic(base_family = "sans", base_size = 11) +
+  theme(
+    axis.title.x          = element_text(size = 10),
+    axis.text.x           = element_text(size = 9, color = "grey20"),
+    axis.ticks.x           = element_line(color = "grey40"),
+    axis.title.y          = element_text(size = 10),
+    axis.text.y           = element_text(size = 9, color = "grey20"),
+    axis.line.y            = element_line(color = "black", linewidth = 0.5),
+    axis.line.x            = element_line(color = "black", linewidth = 0.5),
+    axis.ticks.y          = element_line(color = "grey40"),
+    legend.position         = c(0.98, 0.25),
+    legend.justification    = c(1, 0),
+    legend.title            = element_blank(),
+    legend.text             = element_text(size = 8.5, family = "sans"),
+    legend.key.width        = unit(1.8, "cm"),
+    legend.background       = element_rect(fill = "white", color = "grey80",
+                                           linewidth = 0.3),
+    panel.grid               = element_blank(),
+    plot.margin               = margin(10, 15, 2, 10)
+  )
+
+# --- 下段: No. followed 行のみ（独自の軸は持たない） ---
+risk_panel <- ggplot(risk_table, aes(x = time_days, y = 1)) +
+  geom_text(aes(label = n_followed), size = 3.0, family = "sans",
+            color = "grey20", hjust = 0.5) +
+  shared_x_scale +
+  scale_y_continuous(limits = c(0.9, 1.1), breaks = NULL,
+                     name = "No. followed*") +
+  coord_cartesian(clip = "off") +
+  theme_classic(base_family = "sans", base_size = 11) +
+  theme(
+    axis.title.y        = element_text(size = 9, color = "grey20",
+                                       angle = 0, vjust = 0.5, hjust = 1,
+                                       margin = margin(r = 8)),
+    axis.text.y         = element_blank(),
+    axis.ticks.y         = element_blank(),
+    axis.line.y           = element_blank(),
+    axis.title.x           = element_blank(),
+    axis.text.x            = element_blank(),
+    axis.line.x             = element_blank(),
+    axis.ticks.x            = element_blank(),
+    panel.grid                = element_blank(),
+    plot.margin                = margin(2, 15, 10, 20)
+  )
+
+# --- cowplotで左右軸を強制的に揃えて結合（曲線+X軸が上、No. followedが下） ---
+fig1 <- plot_grid(
+  fig1_main, risk_panel,
+  ncol = 1, align = "v", axis = "lr",
+  rel_heights = c(4, 0.6)
+)
+
+print(fig1)
+
+# 8. 出力（PDF + TIFF 600dpi）
+# ============================================================
+output_dir <- "~/Desktop"
+
+ggsave(
+  filename = file.path(output_dir,
+                       "Figure1_DP_Recovery_Turnbull_AFT.pdf"),
+  plot     = fig1,
+  width    = 7.0,
+  height   = 5.8,     # risk table用にわずかに拡張
+  device   = "pdf"
+)
+
+ggsave(
+  filename    = file.path(output_dir,
+                          "Figure1_DP_Recovery_Turnbull_AFT.tiff"),
+  plot        = fig1,
+  width       = 7.0,
+  height      = 5.8,
+  dpi         = 600,
+  compression = "lzw"
+)
+
+cat("\n\u2713 Figure 1 完成（JTCVS対応: 年単位X軸 + number-at-risk代替指標）\n")
+cat("保存先:", output_dir, "\n")
+cat("  - Figure1_DP_Recovery_Turnbull_AFT.pdf\n")
+cat("  - Figure1_DP_Recovery_Turnbull_AFT.tiff (600 dpi, LZW)\n\n")
+
+
+# ============================================================
+# 9. Results記述用サマリー
+# ============================================================
+cat("========================================\n")
+cat("RESULTS SUMMARY\n")
+cat("========================================\n")
+cat(sprintf("N                        : %d\n", nrow(df)))
+cat(sprintf("Recovered                : %d (%.1f%%)\n",
+            sum(df$recovery_confirmed == 1, na.rm=TRUE),
+            sum(df$recovery_confirmed == 1, na.rm=TRUE) /
+              nrow(df) * 100))
+cat(sprintf("Right-censored           : %d (%.1f%%)\n",
+            sum(df$recovery_confirmed == 0, na.rm=TRUE),
+            sum(df$recovery_confirmed == 0, na.rm=TRUE) /
+              nrow(df) * 100))
+cat(sprintf("Median recovery          : %d days\n", med_val))
+cat(sprintf("95%% bootstrap CI         : %d\u2013%d days\n",
+            med_lo_boot, med_hi_boot))
+cat(sprintf("Best-fit AFT model (AIC) : %s (AIC = %.1f)\n",
+            best_model, min(aic_tbl$AIC)))
+cat("\n=== Cumulative Recovery Rates ===\n")
+for (tp in c(30, 60, 90, 180, 365, 730, 1095)) {
+  idx <- which.min(abs(time_grid - tp))
+  cat(sprintf("%4d days: %5.1f%% (95%% CI: %5.1f%%\u2013%5.1f%%)\n",
+              tp,
+              round(boot_med[idx] * 100, 1),
+              round(boot_lo[idx]  * 100, 1),
+              round(boot_hi[idx]  * 100, 1)))
+}
+cat("========================================\n")# 表示上限: 3年（1095日）
+# --- 表示終端の選択 ---
+# Option A: 3年まで表示（No. followedは2.5年以降10で横ばい）
+# Option B: 2.5年で打ち切り（同じ情報量でより簡潔）
+# 使う方のコメントを外してください（どちらか一方のみ有効にする）
+t_max     <- 1095      # Option A: 3年（912.5日以降と情報量は同じ）
+# t_max   <- 913.125   # Option B: 2.5年ちょうどで打ち切り（2.5*365.25）
+time_grid <- seq(0, t_max, by = 1)
+cat(sprintf("time_grid: 0 – %.2f days (display limit: %.2f years)\n\n",
+            t_max, t_max / 365.25))
+
+
+# ============================================================
+# 1. Turnbull NPMLE（主解析）
+# ============================================================
+surv_obj <- Surv(
+  time  = df$left_time,
+  time2 = df$right_time,
+  type  = "interval2"
+)
+fit_km <- survfit(surv_obj ~ 1)
+
+tb_df <- data.frame(
+  time   = c(0, fit_km$time),
+  surv   = c(1, fit_km$surv),
+  lower  = c(1, fit_km$lower),
+  upper  = c(1, fit_km$upper)
+) %>%
+  mutate(
+    cumrec       = 1 - surv,
+    cumrec_lower = 1 - upper,
+    cumrec_upper = 1 - lower
+  )
+
+tb_df_extended <- tb_df %>%
+  bind_rows(
+    data.frame(
+      time         = t_max,
+      surv         = tail(tb_df$surv, 1),
+      lower        = tail(tb_df$lower, 1),
+      upper        = tail(tb_df$upper, 1),
+      cumrec       = tail(tb_df$cumrec, 1),
+      cumrec_lower = tail(tb_df$cumrec_lower, 1),
+      cumrec_upper = tail(tb_df$cumrec_upper, 1)
+    )
+  )
+
+tb_df_line <- tb_df_extended %>%
+  mutate(model = "Turnbull NPMLE")
+
+
+# ============================================================
 # 2. Bootstrap 95% CI（2000 iterations、タイムアウト保護付き）
 #    一部のリサンプルでTurnbull EMアルゴリズムが病的に遅くなる
 #    ケースが確認されたため（Mac mini/MacBook Air双方で再現）、
