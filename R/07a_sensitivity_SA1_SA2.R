@@ -205,9 +205,9 @@ risk_panel <- ggplot(risk_table_long, aes(x = time_days, y = y_pos)) +
   theme(
     axis.title.y  = element_text(size = 9, color = "grey20",
                                  angle = 0, vjust = 0.5, hjust = 1,
-                                 margin = margin(r = 8)),
+                                 margin = margin(r = 10)),
     axis.text.y   = element_text(size = 7.5, color = "grey20",
-                                 margin = margin(r = 6)),
+                                 margin = margin(r = 10)),
     axis.ticks.y  = element_blank(),
     axis.line.y   = element_blank(),
     axis.title.x  = element_blank(),
